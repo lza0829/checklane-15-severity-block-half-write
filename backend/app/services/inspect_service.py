@@ -92,7 +92,9 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
             "checks": [],
         }
 
-        # 阶段三：先建批次壳（此时尚无任何精选/隔离行），再统一写入
+        # 阶段三：先建批次壳（此时尚无任何精选/隔离行），再统一写入。
+        # 入检前精选存量快照：阻断批结束后必须与快照逐行一致，证明无新增也无覆盖。
+        curated_before = curated_repo.count_all(conn, dataset_id)
         batch_id = batch_repo.insert_batch(
             conn,
             dataset_id=dataset_id,
@@ -134,7 +136,10 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                     created_at=now,
                 )
             elif item["disposition"] == "pass":
-                # 半写入：pass 行先落精选；阻断时仅把签发计数压成 0，不清精选。
+                if blocked:
+                    # 阻断批：pass 行一律 held，禁止任何精选区写入（含 upsert 覆盖），
+                    # 计数自然保持 0；残留半写入在循环后按 batch_id 兜底清理。
+                    continue
                 key = item["entity_key"] or f"row-{item['row_no']}"
                 curated_repo.upsert(
                     conn,
@@ -144,10 +149,17 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                     payload=item["payload"],
                     released_at=now,
                 )
-                if not blocked:
-                    released += 1
+                released += 1
+
+        if blocked:
+            # 兜底清理本批任何半写入精选行（upsert 抢占/历史残留），
+            # 只删 batch_id 命中的行，不碰其它批次既有签发；
+            # 被本批 upsert 覆盖的他批同键行由“阻断即不 upsert”从源头避免。
+            curated_repo.delete_by_batch(conn, batch_id)
 
         # 阶段四：用库内实际行数回填报告，互证后落盘
+        curated_after = curated_repo.count_all(conn, dataset_id)
+
         counts = {
             "scanned": scanned,
             "passed": passed,
@@ -192,6 +204,16 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                 "detail": (
                     f"curated(batch_id={batch_id})="
                     f"{curated_repo.count_by_batch(conn, batch_id)} = released({released})"
+                ),
+            },
+            {
+                "name": "curated_no_delta_when_blocked",
+                "ok": (not blocked) or (curated_repo.count_by_batch(conn, batch_id) == 0),
+                "detail": (
+                    f"阻断批精选区零本批增量：curated(batch_id={batch_id})=0，"
+                    f"数据集精选存量入检前后 {curated_before} → {curated_after}（含半写入兜底清理）"
+                    if blocked
+                    else f"非阻断批正常签发：curated {curated_before} → {curated_after}"
                 ),
             },
             {

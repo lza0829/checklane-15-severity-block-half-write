@@ -176,6 +176,115 @@ def test_curated_delete_by_batch_only_affects_target_batch(env):
         conn.close()
 
 
+def test_blocked_batch_leaves_preexisting_curated_untouched(env):
+    """入检前精选区已有存量（含与本批 pass 行同键的行）：阻断后存量逐行不变，
+    无新增也无覆盖，批次态 blocked、签发 0 三者同时成立。"""
+    from app.db import connect
+    from app.repositories import curated, quarantine
+
+    conn = connect()
+    try:
+        # 既有精选：ORD-1 与夹具内 pass 行同键（验证阻断不得 upsert 覆盖），
+        # EXTRA-9 是本批完全不涉及的存量（验证不得误删）。
+        curated.upsert(
+            conn,
+            dataset_id=1,
+            batch_id=999,
+            entity_key="ORD-1",
+            payload={"entity_key": "ORD-1", "title": "既有版本-不得被覆盖"},
+            released_at="2026-01-01T00:00:00Z",
+        )
+        curated.upsert(
+            conn,
+            dataset_id=1,
+            batch_id=999,
+            entity_key="EXTRA-9",
+            payload={"entity_key": "EXTRA-9"},
+            released_at="2026-01-01T00:00:00Z",
+        )
+        conn.commit()
+        before = {r["entity_key"]: r for r in curated.list_all(conn, dataset_id=1)}
+        assert set(before) == {"ORD-1", "EXTRA-9"}
+    finally:
+        conn.close()
+
+    detail = env.run_inspect(1)
+
+    # 阻断态 + 签发 0 + 精选无本批增量
+    assert detail["blocked"] == 1
+    assert detail["status"] == "blocked"
+    assert detail["released_count"] == 0
+    assert detail["curated_total"] == len(before)
+
+    conn = connect()
+    try:
+        after = {r["entity_key"]: r for r in curated.list_all(conn, dataset_id=1)}
+        # 入检前后精选存量逐行一致：键集合、payload、来源 batch_id 都未变
+        assert set(after) == set(before)
+        for key, row in before.items():
+            assert after[key]["payload"] == row["payload"]
+            assert after[key]["batch_id"] == row["batch_id"] == 999
+        # 本批在精选区零留痕
+        assert curated.count_by_batch(conn, detail["id"]) == 0
+        # 隔离区 error 行照常留证
+        assert quarantine.count_by_batch(conn, detail["id"]) == 2
+        assert quarantine.count_all(conn) == 2
+    finally:
+        conn.close()
+
+    checks = {c["name"]: c for c in detail["report"]["checks"]}
+    assert checks["curated_no_delta_when_blocked"]["ok"] is True
+    assert "零本批增量" in checks["curated_no_delta_when_blocked"]["detail"]
+    assert "2 → 2" in checks["curated_no_delta_when_blocked"]["detail"]
+    assert checks["curated_rows_for_batch"]["ok"] is True
+
+
+def test_blocked_batch_sweeps_half_written_curated_rows(env):
+    """阻断路径上若已存在本批 batch_id 的半写入精选行，入检结束前必须清掉，
+    使精选区相对入检前零增量。"""
+    from app.db import connect
+    from app.repositories import curated
+
+    # 先跑一个正常批次留存量，确保兜底清理不波及他批
+    keep = env.run_inspect(3)
+    assert keep["released_count"] == 6
+
+    conn = connect()
+    try:
+        before_total = curated.count_all(conn)
+        # 预先拿到下一个批次 id 并植入“半写入”残留（模拟写入先于阻断裁定）
+        next_id = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS n FROM inspect_batches").fetchone()["n"]
+        curated.upsert(
+            conn,
+            dataset_id=1,
+            batch_id=next_id,
+            entity_key="HALF-WRITTEN-1",
+            payload={"entity_key": "HALF-WRITTEN-1"},
+            released_at="2026-01-01T00:00:00Z",
+        )
+        conn.commit()
+        assert curated.count_by_batch(conn, next_id) == 1
+    finally:
+        conn.close()
+
+    detail = env.run_inspect(1)
+    assert detail["id"] == next_id
+    assert detail["blocked"] == 1 and detail["released_count"] == 0
+
+    conn = connect()
+    try:
+        # 半写入已清；他批既有签发原样保留；精选总量回到入检前
+        assert curated.count_by_batch(conn, next_id) == 0
+        assert curated.count_all(conn) == before_total
+        assert curated.count_by_batch(conn, keep["id"]) == 6
+        assert all(r["entity_key"] != "HALF-WRITTEN-1" for r in curated.list_all(conn, dataset_id=1))
+    finally:
+        conn.close()
+
+    checks = {c["name"]: c for c in detail["report"]["checks"]}
+    assert checks["curated_no_delta_when_blocked"]["ok"] is True
+
+
 def test_init_db_migrates_legacy_schema(tmp_path, monkeypatch):
     """老库缺 blocked/release_state 列时启动自动补齐，旧数据仍可读。"""
     import sqlite3
